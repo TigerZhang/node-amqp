@@ -1208,7 +1208,7 @@ Connection.prototype.exchange = function (name, options, openCallback) {
   if (name != '' && options.type === undefined) options.type = 'topic';
 
   if (this.exchanges[name]) { // already declared? callback anyway
-    if (openCallback) 
+    if (openCallback)
       openCallback(this.exchanges[name]);
     return this.exchanges[name];
   }
@@ -1502,6 +1502,13 @@ Queue.prototype.shift = function () {
   }
 };
 
+Queue.prototype.publish = function(body /* options */) {
+  var c = this.connection;
+  if (!c._nonameExchange) c._nonameExchange = c.exchange('', {'type': 'direct'});
+  options = {};
+  if (!arguments[1] == undefined) mixin(options, arguments[1]);
+  return c._nonameExchange.publish(this.name, body, options);
+};
 
 Queue.prototype.bind = function (/* [exchange,] routingKey */) {
   var self = this;

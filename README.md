@@ -81,9 +81,6 @@ publishes the message to the queue named.
 `amqp.Connection` is derived from `net.Stream` and has all the same methods.
 So use `connection.end()` to terminate a connection gracefully.
 
-
-
-
 ## Queue
 
 Events: A queue will call the callback given to the `connection.queue()`
@@ -160,6 +157,9 @@ This method will emit 'basicConsumeOk' when ready.
 For use with `subscribe({ack: true}, fn)`. Acknowledges the last
 message.
 
+### queue.publish(body [, options])
+
+Publish a message directly to the queue.
 
 ### queue.bind([exchange,] routing)
 
