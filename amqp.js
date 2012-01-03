@@ -764,7 +764,6 @@ function serializeFields (buffer, fields, args, strict) {
   }
 }
 
-
 function Connection (connectionArgs, options) {
   net.Stream.call(this);
 
@@ -899,6 +898,13 @@ Connection.prototype.setImplOptions = function(options) {
 Connection.prototype.reconnect = function () {
   this.connect(this.options.port, this.options.host);
 };
+
+Connection.prototype.createChannel = function(openCallback) {
+  this.channelCounter++;
+  var channel = new Channel(this, this.channelCounter);
+  this.channels[this.channelCounter] = channel;
+  return channel;
+}
 
 Connection.prototype._onMethod = function (channel, method, args) {
   debug(channel + " > " + method.name + " " + JSON.stringify(args));
@@ -1169,6 +1175,7 @@ Connection.prototype._sendBody = function (channel, body, properties) {
 };
 
 
+// Easy API for creating queues.
 // Options
 // - passive (boolean)
 // - durable (boolean)
@@ -1180,31 +1187,37 @@ Connection.prototype.queue = function (name /* options, openCallback */) {
     options = arguments[1];
     callback = arguments[2];
   } else {
+    options = {};
     callback = arguments[1];
   }
 
-  this.channelCounter++;
-  var channel = this.channelCounter;
-
-  var q = new Queue(this, channel, name, options, callback);
-  this.channels[channel] = q;
-  return q;
+  var channel = this.createChannel();
+  var queue = new Queue(channel, options);
+  channel.on('open',  function() {
+      channel.call(
+          methods.queueDeclare,
+          { reserved1: 0
+            , queue: name
+            , passive: options.passive ? true : false
+            , durable: options.durable ? true : false
+            , exclusive: options.exclusive ? true : false
+            , autoDelete: options.autoDelete ? true : false
+            , noWait: false
+            , "arguments": {}
+          },
+          methods.queueDeclareOk,
+          function(qOk) {
+              queue.name = qOk.queue;
+              if (callback) callback(queue);
+          });
+  });
+  return queue;
 };
 
-// remove a queue when it's closed (called from Queue)
-Connection.prototype.queueClosed = function (name) {
-  if (this.queues[name]) delete this.queues[name];
-};
-
-// remove an exchange when it's closed (called from Exchange)
-Connection.prototype.exchangeClosed = function (name) {
-  if (this.exchanges[name]) delete this.exchanges[name];
-};
-
-
+// Easy API for creating exchanges.
 // connection.exchange('my-exchange', { type: 'topic' });
 // Options
-// - type 'fanout', 'direct', or 'topic' (default)
+// - type 'fanout', 'direct', 'headers', or 'topic' (default)
 // - passive (boolean)
 // - durable (boolean)
 // - autoDelete (boolean, default true)
@@ -1214,11 +1227,28 @@ Connection.prototype.exchange = function (name, options, openCallback) {
   if (!options) options = {};
   if (name != '' && options.type === undefined) options.type = 'topic';
 
-  this.channelCounter++;
-  var channel = this.channelCounter;
-  var exchange = new Exchange(this, channel, name, options, openCallback);
-  this.channels[channel] = exchange;
-  this.exchanges[name] = exchange;
+  var channel = this.createChannel();
+  var exchange = new Exchange(channel, name, options);
+
+  channel.on('open', function() {
+        channel.call(
+            methods.exchangeDeclare,
+            { reserved1:  0
+              , reserved2:  false
+              , reserved3:  false
+              , exchange:   name
+              , type:       options.type || 'direct'
+              , passive:    options.passive    ? true : false
+              , durable:    options.durable    ? true : false
+              , autoDelete: options.autoDelete ? true : false
+              , internal:   options.internal   ? true : false
+              , noWait:     false
+              , "arguments": {}
+            }, methods.exchangeDeclareOk,
+            function() {
+                if (openCallback) openCallback(exchange);
+            });
+  });
   return exchange;
 };
 
@@ -1227,8 +1257,6 @@ Connection.prototype.publish = function (routingKey, body, options) {
   if (!this._defaultExchange) this._defaultExchange = this.exchange();
     return this._defaultExchange.publish(routingKey, body, options);
 };
-
-
 
 // Properties:
 // - routingKey
@@ -1248,12 +1276,12 @@ Connection.prototype.publish = function (routingKey, body, options) {
 // - userId
 // - appId
 // - clusterId
-function Message (queue, args) {
+function Message (channel, args) {
   var msgProperties = classes[60].fields;
 
   events.EventEmitter.call(this);
 
-  this.queue = queue;
+  this.channel = channel;
 
   this.deliveryTag = args.deliveryTag;
   this.redelivered = args.redelivered;
@@ -1269,29 +1297,38 @@ function Message (queue, args) {
 }
 util.inherits(Message, events.EventEmitter);
 
-
 // Acknowledge recept of message.
 // Set first arg to 'true' to acknowledge this and all previous messages
 // received on this queue.
 Message.prototype.acknowledge = function (all) {
-  this.queue.connection._sendMethod(this.queue.channel, methods.basicAck,
-      { reserved1: 0
-      , deliveryTag: this.deliveryTag
-      , multiple: all ? true : false
-      });
+    this.channel.cast(methods.basicAck,
+                      { reserved1: 0
+                        , deliveryTag: this.deliveryTag
+                        , multiple: all ? true : false});
 };
 
-
-// This class is not exposed to the user. Queue and Exchange are subclasses
-// of Channel. This just provides a task queue.
-function Channel (connection, channel) {
+// The 'advanced' interface, of which Queue and Exchange are facades.
+function Channel(connection, number) {
   events.EventEmitter.call(this);
 
-  this.channel = channel;
+  this.channel = number;
   this.connection = connection;
   this._tasks = [];
+  this.consumerTagListeners = {};
 
-  this.connection._sendMethod(channel, methods.channelOpen, {reserved1: ""});
+  var self = this;
+  // route messages to subscribers based on consumerTag
+  this.on('delivery', function(message) {
+    if (message.consumerTag && self.consumerTagListeners[message.consumerTag]) {
+      self.consumerTagListeners[message.consumerTag](message);
+    }
+  });
+
+  this.call(methods.channelOpen, {reserved1: ""},
+            methods.channelOpenOk, function() {
+                debug('Channel open ' + number);
+                self.emit('open');
+            });
 }
 util.inherits(Channel, events.EventEmitter);
 
@@ -1308,22 +1345,23 @@ Channel.prototype._taskPush = function (reply, cb) {
 };
 
 Channel.prototype._tasksFlush = function () {
-  if (this.state != 'open') return;
-
+  if (this.state === 'closing' || this.state === 'closed') return;
   for (var i = 0; i < this._tasks.length; i++) {
     var task = this._tasks[i];
     if (task.sent) continue;
     task.cb();
     task.sent = true;
     if (!task.reply) {
-      // if we don't expect a reply, just delete it now
+      // if we don't expect a reply, just delete it now and signal
+      // completion
       this._tasks.splice(i, 1);
       i = i-1;
+      task.promise.emitSuccess();
     }
   }
 };
 
-Channel.prototype._handleTaskReply = function (channel, method, args) {
+Channel.prototype._handleTaskReply = function (method, args) {
   var task, i;
 
   for (i = 0; i < this._tasks.length; i++) {
@@ -1335,7 +1373,6 @@ Channel.prototype._handleTaskReply = function (channel, method, args) {
       return true;
     }
   }
-
   return false;
 };
 
@@ -1343,89 +1380,132 @@ Channel.prototype._onChannelMethod = function(channel, method, args) {
     switch (method) {
     case methods.channelCloseOk:
         delete this.connection.channels[this.channel]
-        this.state = 'closed'
+        this.state = 'closed';
+    case methods.basicDeliver:
+      this.currentMessage = new Message(this, args);
+      break;
     default:
-        this._onMethod(channel, method, args);
+        // %%% NB returns, confirms, errors.
+        if (this._handleTaskReply(method, args)) {
+        }
+        else {
+            this.emit(methods.method, args);
+        }
     }
+};
+
+Channel.prototype._onContentHeader = function (channel, classInfo, weight, properties, size) {
+  mixin(this.currentMessage, properties);
+  this.currentMessage.read = 0;
+  this.currentMessage.size = size;
+  this.emit('delivery', this.currentMessage);
+};
+
+Channel.prototype._onContent = function (channel, data) {
+  this.currentMessage.read += data.length
+  this.currentMessage.emit('data', data);
+  if (this.currentMessage.read == this.currentMessage.size) {
+    this.currentMessage.emit('end');
+  }
+};
+
+// Send a method with the expectation of a reply; call the callback
+// once there's a reply.
+Channel.prototype.call = function(method, args, reply, callback) {
+    var self = this;
+    var promise = this._taskPush(reply, function () {
+        debug('Channel.called ' + method.name + util.inspect(args));
+        self.connection._sendMethod(self.channel, method, args);
+    });
+    if (callback) promise.addCallback(callback);
+    return promise;
+};
+
+// Send a method with no expectation of a reply. Since there's no
+// response, a callback is pointless. To synchronise on the method
+// having been sent, use the returned promise.
+Channel.prototype.cast = function(method, args) {
+    var self = this;
+    return this._taskPush(null, function() {
+        self.connection._sendMethod(self.channel, method, args);
+    });
+};
+
+// Add a new consumer. This and cancel are special cases because we
+// need to dispatch on the consumer tag. To get access to the consumer
+// tag, or to synchronise on the consumeOk, add a callback to the
+// returned promise.
+Channel.prototype.consume = function(queueName, options) {
+    var self = this;
+    var messageListener = arguments[arguments.length-1];
+    var options = { };
+    if (typeof arguments[1] == 'object') {
+        mixin(options, arguments[1]);
+    }
+    return this.call(
+        methods.basicConsume,
+        { reserved1: 0
+          , queue: queueName
+          , consumerTag: ''
+          , noLocal: options.noLocal ? true : false
+          , noAck: options.noAck ? true : false
+          , exclusive: options.exclusive ? true : false
+          , noWait: false
+          , "arguments": {}
+        }, methods.basicConsumeOk,
+        function(ok) {
+            self.consumerTagListeners[ok.consumerTag] = messageListener;
+        });
 }
 
+Channel.prototype.cancel = function(consumerTag) {
+    var self = this;
+    return this.call(
+        methods.basicCancel,
+        {reserved1: 0, consumerTag: consumerTag, noWait: false},
+        methods.basicCancelOk, function() {
+            delete self.consumerTagListeners[consumerTag];
+        });
+};
+
+Channel.prototype.publish = function(content, options) {
+    var self = this;
+    this._taskPush(null, function() {
+        self.connection._sendMethod(
+            self.channel, methods.basicPublish, options);
+        self.connection._sendBody(self.channel, content, options);
+    });
+};
+
 Channel.prototype.close = function() { 
-  this.state = 'closing';
+    this.state = 'closing';
     this.connection._sendMethod(this.channel, methods.channelClose,
                                 {'replyText': 'Goodbye from node',
                                  'replyCode': 200,
                                  'classId': 0,
                                  'methodId': 0});
-}
+};
 
-function Queue (connection, channel, name, options, callback) {
-  Channel.call(this, connection, channel);
-
-  this.name = name;
-  this.consumerTagListeners = {};
-  
-  var self = this;
-  
-  // route messages to subscribers based on consumerTag
-  this.on('rawMessage', function(message) {
-    if (message.consumerTag && self.consumerTagListeners[message.consumerTag]) {
-      self.consumerTagListeners[message.consumerTag](message);
-    }
-  });
-  
+function Queue(channel, options) {
+  this.channel = channel;
+  // let this be set by the callback when declared.
+  // this.name = name;
   this.options = { autoDelete: true };
   if (options) mixin(this.options, options);
-
-  this._openCallback = callback;
 }
-util.inherits(Queue, Channel);
 
 Queue.prototype.subscribeRaw = function (/* options, messageListener */) {
   var self = this;
-
   var messageListener = arguments[arguments.length-1];
-  var consumerTag = 'node-amqp-'+process.pid+'-'+Math.random();
-  this.consumerTagListeners[consumerTag] = messageListener;
-
   var options = { };
   if (typeof arguments[0] == 'object') {
     mixin(options, arguments[0]);
   }
-
-  if (options.prefetchCount) {
-    self.connection._sendMethod(self.channel, methods.basicQos,
-        { reserved1: 0
-        , prefetchSize: 0
-        , prefetchCount: options.prefetchCount
-        , global: false
-        });
-  }
-
-  return this._taskPush(methods.basicConsumeOk, function () {
-    self.connection._sendMethod(self.channel, methods.basicConsume,
-        { reserved1: 0
-        , queue: self.name
-        , consumerTag: consumerTag
-        , noLocal: options.noLocal ? true : false
-        , noAck: options.noAck ? true : false
-        , exclusive: options.exclusive ? true : false
-        , noWait: false
-        , "arguments": {}
-        });
-  });
+  return this.channel.consume(this.name, options, messageListener);
 };
 
 Queue.prototype.unsubscribe = function(consumerTag) {
-  var self = this;
-  return this._taskPush(methods.basicCancelOk, function () {
-    self.connection._sendMethod(self.channel, methods.basicCancel,
-                                { reserved1: 0,
-                                  consumerTag: consumerTag,
-                                  noWait: false });
-  })
-  .addCallback(function () {
-    delete self.consumerTagListeners[consumerTag];
-  });
+    return this.channel.cancel(consumerTag);
 };
 
 Queue.prototype.subscribe = function (/* options, messageListener */) {
@@ -1446,16 +1526,15 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
       options.deliveryTagInPayload = arguments[0].deliveryTagInPayload;
     if (arguments[0].prefetchCount != undefined)
       options.prefetchCount = arguments[0].prefetchCount;
-
   }
 
   if (options.ack) {
-    self.connection._sendMethod(self.channel, methods.basicQos,
-        { reserved1: 0
-        , prefetchSize: 0
-        , prefetchCount: options.prefetchCount
-        , global: false
-        });
+      self.channel.cast(methods.basicQos,
+                        { reserved1: 0
+                          , prefetchSize: 0
+                          , prefetchCount: options.prefetchCount
+                          , global: false
+                        });
   }
 
   // basic consume
@@ -1520,6 +1599,7 @@ Queue.prototype.subscribe = function (/* options, messageListener */) {
         }
       }
       if (messageListener) messageListener(json, headers, deliveryInfo, m);
+        // Yuck -- only does this if you've subscribed!
       self.emit('message', json, headers, deliveryInfo, m);
     });
   });
@@ -1535,11 +1615,9 @@ Queue.prototype.shift = function () {
 
 
 Queue.prototype.bind = function (/* [exchange,] routingKey */) {
-  var self = this;
-
   // The first argument, exchange is optional.
   // If not supplied the connection will use the 'amq.topic'
-  // exchange.
+  // exchange. NB Not the connection default exchange.
 
   var exchange, routingKey;
 
@@ -1551,28 +1629,19 @@ Queue.prototype.bind = function (/* [exchange,] routingKey */) {
     routingKey = arguments[0];
   }
 
-
   var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
 
-  if(exchangeName in self.connection.exchanges) {
-    this.exchange = self.connection.exchanges[exchangeName];
-    this.exchange.binds++;
-  }
-
-  self.connection._sendMethod(self.channel, methods.queueBind,
-      { reserved1: 0
-      , queue: self.name
-      , exchange: exchangeName
-      , routingKey: routingKey
-      , noWait: false
-      , "arguments": {}
-      });
-
+  return this.channel.call(methods.queueBind,
+                           { reserved1: 0
+                             , queue: this.name
+                             , exchange: exchangeName
+                             , routingKey: routingKey
+                             , noWait: false
+                             , "arguments": {}
+                           }, methods.queueBindOk);
 };
 
 Queue.prototype.unbind = function (/* [exchange,] routingKey */) {
-  var self = this;
-
   // The first argument, exchange is optional.
   // If not supplied the connection will use the default 'amq.topic'
   // exchange.
@@ -1587,23 +1656,19 @@ Queue.prototype.unbind = function (/* [exchange,] routingKey */) {
     routingKey = arguments[0];
   }
 
+  var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
 
-  return this._taskPush(methods.queueUnbindOk, function () {
-    var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
-    self.connection._sendMethod(self.channel, methods.queueUnbind,
-        { reserved1: 0
-        , queue: self.name
-        , exchange: exchangeName
-        , routingKey: routingKey
-        , noWait: false
-        , "arguments": {}
-        });
-  });
+  return this.channel.call(methods.queueUnbind,
+                           { reserved1: 0
+                             , queue: this.name
+                             , exchange: exchangeName
+                             , routingKey: routingKey
+                             , noWait: false
+                             , "arguments": {}
+                           }, methods.queueUnbindOk);
 };
 
 Queue.prototype.bind_headers = function (/* [exchange,] matchingPairs */) {
-  var self = this;
-
   // The first argument, exchange is optional.
   // If not supplied the connection will use the default 'amq.headers'
   // exchange.
@@ -1618,207 +1683,36 @@ Queue.prototype.bind_headers = function (/* [exchange,] matchingPairs */) {
     matchingPairs = arguments[0];
   }
 
+  var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
 
-  return this._taskPush(methods.queueBindOk, function () {
-    var exchangeName = exchange instanceof Exchange ? exchange.name : exchange;
-    self.connection._sendMethod(self.channel, methods.queueBind,
-        { reserved1: 0
-        , queue: self.name
-        , exchange: exchangeName
-        , routingKey: ''
-        , noWait: false
-        , "arguments": matchingPairs
-        });
-  });
+    return this.channel.call(methods.queueBind,
+                             { reserved1: 0
+                               , queue: this.name
+                               , exchange: exchangeName
+                               , routingKey: ''
+                               , noWait: false
+                               , "arguments": matchingPairs
+                             }, methods.queueBindOk);
 };
 
-
 Queue.prototype.destroy = function (options) {
-  var self = this;
-
   options = options || {};
-
-  return this._taskPush(methods.queueDeleteOk, function () {
-    self.connection.queueClosed(self.name);
-    if('exchange' in self) {
-      self.exchange.binds--;
-      self.exchange.cleanup();
-    }
-    self.connection._sendMethod(self.channel, methods.queueDelete,
-        { reserved1: 0
+  return this.channel.call(
+      methods.queueDelete, 
+      { reserved1: 0
         , queue: self.name
         , ifUnused: options.ifUnused ? true : false
         , ifEmpty: options.ifEmpty ? true : false
         , noWait: false
         , "arguments": {}
-    });
-  });
+      }, methods.queueDeleteOk);
 };
 
-
-Queue.prototype._onMethod = function (channel, method, args) {
-  this.emit(method.name, args);
-  if (this._handleTaskReply.apply(this, arguments)) return;
-
-  switch (method) {
-    case methods.channelOpenOk:
-      this.connection._sendMethod(channel, methods.queueDeclare,
-          { reserved1: 0
-          , queue: this.name
-          , passive: this.options.passive ? true : false
-          , durable: this.options.durable ? true : false
-          , exclusive: this.options.exclusive ? true : false
-          , autoDelete: this.options.autoDelete ? true : false
-          , noWait: false
-          , "arguments": this.options.arguments || {}
-          });
-      this.state = "declare queue";
-      break;
-
-    case methods.queueDeclareOk:
-      this.state = 'open';
-      this.name = args.queue;
-      this.connection.queues[this.name] = this;
-      if (this._openCallback) {
-        this._openCallback(this);
-        this._openCallback = null;
-      }
-      // TODO this is legacy interface, remove me
-      this.emit('open', args.queue, args.messageCount, args.consumerCount);
-      break;
-
-    case methods.basicConsumeOk:
-      debug('basicConsumeOk', util.inspect(args, null));
-      break;
-
-    case methods.queueBindOk:
-      break;
-
-    case methods.basicQosOk:
-      break;
-
-    case methods.channelClose:
-      this.state = "closed";
-      this.connection.queueClosed(this.name);
-      var e = new Error(args.replyText);
-      e.code = args.replyCode;
-      this.emit('error', e);
-      this.emit('close');
-      break;
-    
-    case methods.channelCloseOk:
-      this.connection.queueClosed(this.name);
-      this.emit('close')
-      break;
-    
-    case methods.basicDeliver:
-      this.currentMessage = new Message(this, args);
-      break;
-
-    case methods.queueDeleteOk:
-      break;
-
-    default:
-      throw new Error("Uncaught method '" + method.name + "' with args " +
-          JSON.stringify(args) + "; tasks = " + JSON.stringify(this._tasks));
-  }
-
-  this._tasksFlush();
-};
-
-
-Queue.prototype._onContentHeader = function (channel, classInfo, weight, properties, size) {
-  mixin(this.currentMessage, properties);
-  this.currentMessage.read = 0;
-  this.currentMessage.size = size;
-
-  this.emit('rawMessage', this.currentMessage);
-};
-
-Queue.prototype._onContent = function (channel, data) {
-  this.currentMessage.read += data.length
-  this.currentMessage.emit('data', data);
-  if (this.currentMessage.read == this.currentMessage.size) {
-    this.currentMessage.emit('end');
-  }
-};
-
-
-
-
-function Exchange (connection, channel, name, options, openCallback) {
-  Channel.call(this, connection, channel);
+function Exchange (channel, name, options) {
+  this.channel = channel;
   this.name = name;
-  this.binds = 0; // keep track of queues bound
   this.options = options || { autoDelete: true};
-  this._openCallback = openCallback;
 }
-util.inherits(Exchange, Channel);
-
-
-
-Exchange.prototype._onMethod = function (channel, method, args) {
-  this.emit(method.name, args);
-  if (this._handleTaskReply.apply(this, arguments)) return true;
-
-  switch (method) {
-    case methods.channelOpenOk:
-      // Pre-baked exchanges don't need to be declared
-      if (/^$|(amq\.)/.test(this.name)) {
-        this.state = 'open';
-        this.emit('open');
-      } else {
-        this.connection._sendMethod(channel, methods.exchangeDeclare,
-            { reserved1:  0
-            , reserved2:  false
-            , reserved3:  false
-            , exchange:   this.name
-            , type:       this.options.type || 'topic'
-            , passive:    this.options.passive    ? true : false
-            , durable:    this.options.durable    ? true : false
-            , autoDelete: this.options.autoDelete ? true : false
-            , internal:   this.options.internal   ? true : false
-            , noWait:     false
-            , "arguments": {}
-            });
-        this.state = 'declaring';
-      }
-      break;
-
-    case methods.exchangeDeclareOk:
-      this.state = 'open';
-      this.emit('open');
-      if (this._openCallback) {
-        this._openCallback(this);
-        this._openCallback = null;
-      }
-      break;
-
-    case methods.channelClose:
-      this.state = "closed";
-      this.connection.exchangeClosed(this.name);
-      var e = new Error(args.replyText);
-      e.code = args.replyCode;
-      this.emit('error', e);
-      this.emit('close');
-      break;
-
-    case methods.channelCloseOk:
-      this.connection.exchangeClosed(this.name);
-      this.emit('close');
-      break;
-
-    case methods.basicReturn:
-      this.emit('basic-return', args);
-      break;
-
-    default:
-      throw new Error("Uncaught method '" + method.name + "' with args " +
-          JSON.stringify(args));
-  }
-
-  this._tasksFlush();
-};
 
 
 // exchange.publish('routing.key', 'body');
@@ -1840,44 +1734,24 @@ Exchange.prototype._onMethod = function (channel, method, args) {
 // - appId
 // - clusterId
 Exchange.prototype.publish = function (routingKey, data, options) {
-  var self = this;
 
   options = options || {};
   options.routingKey = routingKey;
-  options.exchange   = self.name;
+  options.exchange   = this.name;
   options.mandatory  = options.mandatory ? true : false;
   options.immediate  = options.immediate ? true : false;
   options.reserved1  = 0;
 
-  return this._taskPush(null, function () {
-    self.connection._sendMethod(self.channel, methods.basicPublish, options);
-    // This interface is probably not appropriate for streaming large files.
-    // (Of course it's arguable about whether AMQP is the appropriate
-    // transport for large files.) The content header wants to know the size
-    // of the data before sending it - so there's no point in trying to have a
-    // general streaming interface - streaming messages of unknown size simply
-    // isn't possible with AMQP. This is all to say, don't send big messages.
-    // If you need to stream something large, chunk it yourself.
-    self.connection._sendBody(self.channel, data, options);
-  });
+  return this.channel.publish(data, options);
 };
 
-// do any necessary cleanups eg. after queue destruction  
-Exchange.prototype.cleanup = function() {
-	if (this.binds == 0) // don't keep reference open if unused
-    	this.connection.exchangeClosed(this.name);
-};
-
-
-Exchange.prototype.destroy = function (ifUnused) {
+Exchange.prototype.destroy = function (options) {
   var self = this;
-  return this._taskPush(methods.exchangeDeleteOk, function () {
-    self.connection.exchangeClosed(self.name);
-    self.connection._sendMethod(self.channel, methods.exchangeDelete,
+    return this.channel.call(
+        methods.exchangeDelete,
         { reserved1: 0
-        , exchange: self.name
-        , ifUnused: ifUnused ? true : false
-        , noWait: false
-        });
-  });
+          , exchange: self.name
+          , ifUnused: ifUnused ? true : false
+          , noWait: false
+        }, methods.exchangeDeleteOk);
 };
