@@ -2,6 +2,7 @@ require('./harness');
 
 var recvCount = 0;
 var body = "hello world";
+var published = 0;
 
 connection.addListener('ready', function () {
   puts("connected to " + connection.serverProperties.product);
@@ -12,8 +13,8 @@ connection.addListener('ready', function () {
         q.on('queueBindOk', function() {
           q.on('basicConsumeOk', function () {
             puts("publishing message");
-            exchange.publish("message.text", body, {contentType: 'text/plain'});
-
+            for(var i = 0; i < 10000; i++) {
+              exchange.publish("message.text", body, {contentType: 'text/plain'}); }
             setTimeout(function () {
               // wait one second to receive the message, then quit
               connection.end();
@@ -21,8 +22,8 @@ connection.addListener('ready', function () {
           });
 
           q.subscribeRaw(function (m) {
-            puts("--- Message (" + m.deliveryTag + ", '" + m.routingKey + "') ---");
-            puts("--- contentType: " + m.contentType);
+            // puts("--- Message (" + m.deliveryTag + ", '" + m.routingKey + "') ---");
+            // puts("--- contentType: " + m.contentType);
 
             recvCount++;
 
@@ -43,5 +44,11 @@ connection.addListener('ready', function () {
 
 
 process.addListener('exit', function () {
-  assert.equal(1, recvCount);
+  puts("recvCount", recvCount);
+  // assert.equal(10000, recvCount);
 });
+
+process.on( 'SIGINT', function() {
+  // some other closing procedures go here
+  process.exit( );
+})
